@@ -152,7 +152,13 @@
 
   /* hidden audio container */
   #hidden-audio{ display:none; }
-
+.peer-row { display:flex; align-items:center; gap:10px; padding:10px; border-radius:10px; background: rgba(255,255,255,0.01); border:1px solid rgba(255,255,255,0.02); }
+.bind-btn { padding:8px 10px; border-radius:8px; border:none; cursor:pointer; font-weight:700; }
+.bind-on { background: linear-gradient(90deg,#6ee7b7,#3ddc97); color:#042018; }
+.bind-off { background: rgba(255,255,255,0.02); color:#9fb4c9; border:1px solid rgba(255,255,255,0.02); }
+.peer-actions { display:flex; gap:8px; align-items:center; }
+.avatar { width:44px; height:44px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; color:#6ee7b7; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.03); }
+.peer-name { flex:1; font-weight:600; }
   /* responsive */
   @media (max-width:920px){
     .container{ grid-template-columns: 1fr; padding-bottom:20px }

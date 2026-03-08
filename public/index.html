@@ -6,6 +6,16 @@
 <title>RPG Voice — MVP Binds (UI Modernizada)</title>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="css/style.css">
+<style>
+/* Estilos locais para os botões e lista de peers */
+.peer-row { display:flex; align-items:center; gap:10px; padding:10px; border-radius:10px; background: rgba(255,255,255,0.01); border:1px solid rgba(255,255,255,0.02); }
+.bind-btn { padding:8px 10px; border-radius:8px; border:none; cursor:pointer; font-weight:700; }
+.bind-on { background: linear-gradient(90deg,#6ee7b7,#3ddc97); color:#042018; }
+.bind-off { background: rgba(255,255,255,0.02); color:#9fb4c9; border:1px solid rgba(255,255,255,0.02); }
+.peer-actions { display:flex; gap:8px; align-items:center; }
+.avatar { width:44px; height:44px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-weight:700; color:#6ee7b7; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.03); }
+.peer-name { flex:1; font-weight:600; }
+</style>
 </head>
 <body>
   <div class="container">
@@ -16,7 +26,6 @@
       </div>
       <div style="display:flex;gap:12px;align-items:center">
         <div class="status-pill" id="status-pill" title="status">
-          <!-- mic icon -->
           <svg id="mic-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" style="opacity:0.95">
             <path d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
             <path d="M19 11v1a7 7 0 0 1-14 0v-1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -72,7 +81,7 @@
         </div>
       </div>
 
-      <div style="margin-top:18px" class="small">Observação: a lógica de binds, broadcast e push-to-talk permanece idêntica — somente a aparência mudou.</div>
+      <div style="margin-top:18px" class="small">Observação: os botões por peer agora são somente <strong>ENVIAR</strong> (seu envio para esse peer) e <strong>OUVIR</strong> (o áudio desse peer localmente).</div>
     </aside>
   </div>
 
@@ -81,17 +90,25 @@
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
-  // Mantive a lógica e os nomes das variáveis/funções originais para não alterar funcionalidades.
+  // --- Variáveis principais (mantidas) ---
   const socket = io();
   let localStream = null;
   const pcs = {}; // peerConnection por socketId
   let participants = {}; // socketId -> { userId }
   let mySocketId = null;
   let groupMode = false;
-  let selectionSet = new Set(); // quem está selecionado para me ouvir (se eu for owner)
   let isJoined = false;
   let IsMuted = true;
   let broadcastMode = false;
+
+  // --- Novos mapas para controlar envio/recepção por peer ---
+  const peerSenders = {};    // peerId -> RTCRtpSender
+  const peerSendTracks = {}; // peerId -> cloned MediaStreamTrack (local) — controlamos .enabled
+  const peerRecvMuted = {};  // peerId -> boolean (true = muted locally)
+
+  // Guarda o estado de envio antes do broadcast (para restauração)
+  // null quando não há snapshot; caso contrário mapa peerId -> { existed: boolean, enabled: boolean }
+  let previousSendState = null;
 
   // elementos UI adicionais
   const roomInput = document.getElementById('room');
@@ -107,22 +124,22 @@
   const broadcastState = document.getElementById('broadcastState');
   const toggleMicBtn = document.getElementById('toggleMicBtn');
 
-  // atalhos de teclado (mantidos)
+  // Atalhos de teclado
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Shift') groupMode = true;
-    if (e.code === 'Space') { // PTT (como no original, dispara toggle aqui)
+    if (e.code === 'Space') { // PTT
       e.preventDefault();
       setMicMuted(!IsMuted);
     }
     if (e.key.toLowerCase() === 'b') {
-      document.getElementById('broadcastBtn').click();
+      broadcastBtn.click();
     }
   });
   document.addEventListener('keyup', (e) => {
     if (e.key === 'Shift') groupMode = false;
   });
 
-  // UI interações
+  // UI interactions
   joinBtn.onclick = async () => {
     if (isJoined) return;
     await startLocalStream();
@@ -136,46 +153,59 @@
   leaveBtn.onclick = () => {
     if (!isJoined) return;
     socket.emit('leave', { room: roomInput.value });
+    // cleanup local resources
     Object.values(pcs).forEach(pc => pc.close());
     Object.keys(pcs).forEach(k => delete pcs[k]);
+    // stop cloned tracks
+    Object.values(peerSendTracks).forEach(t => { try { t.stop(); } catch(e){} });
+    Object.keys(peerSendTracks).forEach(k => delete peerSendTracks[k]);
+    Object.keys(peerSenders).forEach(k => delete peerSenders[k]);
     participants = {};
-    selectionSet.clear();
-    renderPeers();
     isJoined = false;
+    renderPeers();
     status('Saiu da sala');
   };
 
-  broadcastBtn.onclick = () => {
-    if (!isJoined) return;
-    if(!broadcastMode){
-      broadcastMode = true;
-      broadcastBtn.classList.add('btn-primary');
-      broadcastBtn.classList.remove('btn-ghost');
-      broadcastState.textContent = 'ativado';
-      socket.emit("allow-all",{
-         room: roomInput.value,
-         ownerSocketId: mySocketId
-      });
-    }else{
-      broadcastMode = false;
-      broadcastBtn.classList.remove('btn-primary');
-      broadcastBtn.classList.add('btn-ghost');
-      broadcastState.textContent = 'desativado';
-      socket.emit("revoke-all",{
-         room: roomInput.value,
-         ownerSocketId: mySocketId
-      });
-    }
-  };
+  // --- broadcast: agora guarda/restaura previousSendState ---
+broadcastBtn.onclick = () => {
 
-  toggleMicBtn.onclick = () => {
+  if (!broadcastMode) {
+
+    // salva estado anterior
+    previousSendState = {}
+
+    Object.keys(peerSendTracks).forEach(id => {
+      previousSendState[id] = peerSendTracks[id].enabled
+      peerSendTracks[id].enabled = true
+    })
+
+    broadcastMode = true
+    broadcastState.textContent = "ativado"
+
+  } else {
+
+    // restaura estado anterior
+    Object.keys(previousSendState).forEach(id => {
+      if (peerSendTracks[id]) {
+        peerSendTracks[id].enabled = previousSendState[id]
+      }
+    })
+
+    broadcastMode = false
+    broadcastState.textContent = "desativado"
+
+  }
+
+  renderPeers()
+}
+  
+toggleMicBtn.onclick = () => {
     setMicMuted(!IsMuted);
   };
 
-  // signaling handlers
+  // Signaling handlers (mantidos)
   socket.on('connect', () => {
     mySocketId = socket.id;
-    // atualiza status
     status('conectado ao servidor');
   });
 
@@ -188,12 +218,19 @@
 
   socket.on('peer-joined', async ({ socketId, userId }) => {
     if (socketId === socket.id) return;
-    // cria offer para quem entrou (mesma lógica)
+    // cria offer para quem entrou (mantido)
     await createOffer(socketId);
   });
 
   socket.on('peer-left', ({ socketId }) => {
+    // cleanup específico do peer
     if (pcs[socketId]) { pcs[socketId].close(); delete pcs[socketId]; }
+    if (peerSendTracks[socketId]) { try { peerSendTracks[socketId].stop(); } catch(e){} delete peerSendTracks[socketId]; }
+    if (peerSenders[socketId]) delete peerSenders[socketId];
+    if (peerRecvMuted[socketId]) delete peerRecvMuted[socketId];
+    // remove audio element
+    const ael = document.getElementById('a-'+socketId);
+    if (ael && ael.parentNode) ael.parentNode.removeChild(ael);
     renderPeers();
   });
 
@@ -209,7 +246,7 @@
     }
   });
 
-  // local mic
+  // --- Microfone local ---
   async function startLocalStream() {
     try {
       localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -222,7 +259,6 @@
 
   function setMicMuted(muted) {
     if (!localStream) {
-      // se não tiver stream ainda, atualiza estado mesmo assim
       IsMuted = muted;
       micState.textContent = muted ? 'mutado' : 'ativo';
       status('Microfone ' + (muted ? 'mutado' : 'ativo'));
@@ -232,12 +268,12 @@
     localStream.getAudioTracks().forEach(t => t.enabled = !muted);
     micState.textContent = muted ? 'mutado' : 'ativo';
     status('Microfone ' + (muted ? 'mutado' : 'ativo'));
+    // observe: isso controla o track original; os clones permanecem e são independentes
   }
 
-  // Build peers UI and bind buttons
+  // --- Render da lista de peers — agora só com ENVIAR e OUVIR ---
   function renderPeers() {
     peersListDiv.innerHTML = '';
-    // ordena por nome (melhora UX)
     const entries = Object.entries(participants).sort((a,b) => {
       const aName = (a[1].userId || a[0]).toLowerCase();
       const bName = (b[1].userId || b[0]).toLowerCase();
@@ -245,7 +281,7 @@
     });
 
     for (const [id, p] of entries) {
-      if (id === mySocketId) continue; // don't show self
+      if (id === mySocketId) continue;
       const div = document.createElement('div');
       div.className = 'peer-row';
 
@@ -260,87 +296,252 @@
       name.textContent = p.userId || id;
       div.appendChild(name);
 
-      const btn = document.createElement('button');
-      const isOn = selectionSet.has(id);
-      btn.className = 'bind-btn ' + (isOn ? 'bind-on' : 'bind-off');
-      btn.textContent = isOn ? 'ON' : 'OFF';
-      btn.onclick = () => onBindClick(id);
-      div.appendChild(btn);
+      // Ações: ENVIAR (controle de envio por peer) e OUVIR (controle de recepção local)
+      const actions = document.createElement('div');
+      actions.className = 'peer-actions';
+
+      const sendBtn = document.createElement('button');
+      const sendTrack = peerSendTracks[id];
+      const sendOn = !!(sendTrack && sendTrack.enabled);
+      sendBtn.className = 'bind-btn ' + (sendOn ? 'bind-on' : 'bind-off');
+      sendBtn.textContent = sendOn ? 'ENVIAR' : 'PARAR ENV';
+      sendBtn.onclick = () => toggleSendToPeer(id);
+
+      const recvBtn = document.createElement('button');
+      const recvMuted = !!peerRecvMuted[id];
+      const recvOn = !recvMuted; // true if we are listening
+      recvBtn.className = 'bind-btn ' + (recvOn ? 'bind-on' : 'bind-off');
+      recvBtn.textContent = recvOn ? 'OUVIR (ON)' : 'OUVIR (OFF)';
+      recvBtn.onclick = () => toggleReceiveFromPeer(id);
+
+      actions.appendChild(sendBtn);
+      actions.appendChild(recvBtn);
+      div.appendChild(actions);
 
       peersListDiv.appendChild(div);
 
-      // attach audio element for any incoming stream from that peer (if connection exists)
+      // attach/create hidden audio element (recepção)
       if (!document.getElementById('a-'+id)) {
         const a = document.createElement('audio');
         a.id = 'a-'+id;
         a.autoplay = true;
-        // colocamos no container hidden-audio para não poluir UI
+        a.controls = false;
+        a.style.display = 'none';
         document.getElementById('hidden-audio').appendChild(a);
       }
+      // se já existir remoteStream, liga no elemento
       if (pcs[id] && pcs[id].remoteStream) {
         const audioEl = document.getElementById('a-'+id);
-        if (audioEl) audioEl.srcObject = pcs[id].remoteStream;
+        if (audioEl) {
+          audioEl.srcObject = pcs[id].remoteStream;
+          audioEl.muted = !!peerRecvMuted[id];
+        }
       }
     }
   }
 
-  // clicking a bind
-  function onBindClick(targetId) {
-    if (!isJoined) return;
-    if (groupMode) {
-      if (selectionSet.has(targetId)) selectionSet.delete(targetId);
-      else selectionSet.add(targetId);
-      socket.emit('update-binds', { room: roomInput.value, ownerSocketId: mySocketId, allowedTargets: Array.from(selectionSet) });
-    } else {
-      if (selectionSet.size === 1 && selectionSet.has(targetId)) {
-        selectionSet.clear();
-      } else {
-        selectionSet.clear();
-        selectionSet.add(targetId);
+  // --- Toggle: receber de peer (com comportamento single-select sem Shift) ---
+  function toggleReceiveFromPeer(peerId) {
+    // quem atualmente está desmutado (estamos ouvindo)
+    const activeIds = Object.keys(participants).filter(id => id !== mySocketId && !peerRecvMuted[id]);
+
+    if (!groupMode) {
+      // single-select behavior:
+      // se já for o único ativo, desativa (mute) para não ouvir ninguém
+      if (activeIds.length === 1 && activeIds[0] === peerId) {
+        peerRecvMuted[peerId] = true;
+        const a = document.getElementById('a-'+peerId);
+        if (a) a.muted = true;
+        renderPeers();
+        return;
       }
-      socket.emit('update-binds', { room: roomInput.value, ownerSocketId: mySocketId, allowedTargets: Array.from(selectionSet) });
+      // caso contrário, mute todos e só deixe o selecionado desmutado
+      Object.keys(participants).forEach(id => {
+        if (id === mySocketId) return;
+        peerRecvMuted[id] = true;
+        const a = document.getElementById('a-'+id);
+        if (a) a.muted = true;
+      });
+      peerRecvMuted[peerId] = false;
+      const aTarget = document.getElementById('a-'+peerId);
+      if (aTarget) aTarget.muted = false;
+      renderPeers();
+      return;
+    }
+
+    // groupMode = true -> toggle individual
+    const currentlyMuted = !!peerRecvMuted[peerId];
+    peerRecvMuted[peerId] = !currentlyMuted;
+    const a = document.getElementById('a-'+peerId);
+    if (a) a.muted = !!peerRecvMuted[peerId];
+    renderPeers();
+  }
+
+  // --- Toggle: enviar para peer (com comportamento single-select sem Shift) ---
+  function toggleSendToPeer(peerId) {
+    const cloned = peerSendTracks[peerId];
+    // Quem está enviando atualmente (enabled clones)
+    const enabledIds = Object.keys(peerSendTracks).filter(id => peerSendTracks[id] && peerSendTracks[id].enabled);
+
+    if (!groupMode) {
+      // single-select:
+      // se já for o único ativado, desliga (nenhum ativo)
+      if (enabledIds.length === 1 && enabledIds[0] === peerId) {
+        if (cloned) cloned.enabled = false;
+        renderPeers();
+        return;
+      }
+      // caso contrário, desliga todos e ativa o selecionado
+      enabledIds.forEach(id => {
+        if (peerSendTracks[id]) peerSendTracks[id].enabled = false;
+      });
+      // se já existe clone, liga
+      if (cloned) {
+        cloned.enabled = true;
+        renderPeers();
+        return;
+      }
+      // se não existe clone: cria (se houver pc), createOffer se necessário
+      const pc = pcs[peerId];
+      if (!pc) {
+        createOffer(peerId).catch(()=>{});
+        return;
+      }
+      const localAudioTrack = localStream && localStream.getAudioTracks()[0];
+      if (localAudioTrack) {
+        try {
+          const newClone = localAudioTrack.clone();
+          const sender = pc.addTrack(newClone, new MediaStream([newClone]));
+          peerSendTracks[peerId] = newClone;
+          peerSenders[peerId] = sender;
+          newClone.enabled = true;
+          pc.onconnectionstatechange = () => {
+            if (pc.connectionState === 'closed' || pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+              try { newClone.stop(); } catch(e){}
+              delete peerSendTracks[peerId];
+              delete peerSenders[peerId];
+            }
+          };
+        } catch (e) {
+          console.warn('Erro ao adicionar clone para peer', peerId, e);
+        }
+      }
+      renderPeers();
+      return;
+    }
+
+    // groupMode = true -> simple toggle
+    if (cloned) {
+      cloned.enabled = !cloned.enabled;
+      renderPeers();
+      return;
+    }
+    // cria clone se não existir
+    const pc2 = pcs[peerId];
+    if (!pc2) {
+      createOffer(peerId).catch(()=>{});
+      return;
+    }
+    const lat = localStream && localStream.getAudioTracks()[0];
+    if (lat) {
+      try {
+        const newClone = lat.clone();
+        const sender = pc2.addTrack(newClone, new MediaStream([newClone]));
+        peerSendTracks[peerId] = newClone;
+        peerSenders[peerId] = sender;
+        newClone.enabled = true;
+        pc2.onconnectionstatechange = () => {
+          if (pc2.connectionState === 'closed' || pc2.connectionState === 'failed' || pc2.connectionState === 'disconnected') {
+            try { newClone.stop(); } catch(e){}
+            delete peerSendTracks[peerId];
+            delete peerSenders[peerId];
+          }
+        };
+      } catch(e) {
+        console.warn('Erro ao clonar track no toggleSend (groupMode)', e);
+      }
     }
     renderPeers();
   }
 
-  // createOffer: subscriber cria offer para peerSocketId
+  // --- Criação de Offer: adicionamos um clone do track (se disponível) antes de fazer offer ---
   async function createOffer(peerSocketId) {
     if (!localStream) await startLocalStream();
     if (pcs[peerSocketId]) pcs[peerSocketId].close();
     const pc = new RTCPeerConnection();
     pcs[peerSocketId] = pc;
-    try {
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    } catch(e){
-      // se localStream estiver vazio, ignoramos (mantendo comportamento)
+
+    // se houver áudio local, clonamos e adicionamos para esse peer (track independente)
+    const localAudioTrack = localStream && localStream.getAudioTracks()[0];
+    if (localAudioTrack) {
+      try {
+        const cloned = localAudioTrack.clone();
+        const sender = pc.addTrack(cloned, new MediaStream([cloned]));
+        peerSendTracks[peerSocketId] = cloned;
+        peerSenders[peerSocketId] = sender;
+        // por padrão o cloned virá habilitado; se você quer controlá-lo antes de adicioná-lo, mude aqui.
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'closed' || pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+            try { cloned.stop(); } catch(e){}
+            delete peerSendTracks[peerSocketId];
+            delete peerSenders[peerSocketId];
+          }
+        };
+      } catch(e) {
+        console.warn('Erro ao clonar track no createOffer', e);
+      }
     }
+
     pc.onicecandidate = e => { if (e.candidate) socket.emit('signal', { room: roomInput.value, to: peerSocketId, data: { candidate: e.candidate } }); };
     pc.ontrack = e => {
       const a = document.getElementById('a-'+peerSocketId);
       if (a) a.srcObject = e.streams[0];
       pc.remoteStream = e.streams[0];
+      const audioEl = document.getElementById('a-'+peerSocketId);
+      if (audioEl) audioEl.muted = !!peerRecvMuted[peerSocketId];
     };
+
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     socket.emit('signal', { room: roomInput.value, to: peerSocketId, data: { sdp: pc.localDescription } });
     renderPeers();
   }
 
-  // createAnswer: respondendo offer recebido
+  // --- Criação de Answer: também clonamos track se tivermos localStream ---
   async function createAnswer(from, sdpOffer) {
     if (!localStream) await startLocalStream();
     if (pcs[from]) pcs[from].close();
     const pc = new RTCPeerConnection();
     pcs[from] = pc;
-    try {
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-    } catch(e){}
+
+    const localAudioTrack = localStream && localStream.getAudioTracks()[0];
+    if (localAudioTrack) {
+      try {
+        const cloned = localAudioTrack.clone();
+        const sender = pc.addTrack(cloned, new MediaStream([cloned]));
+        peerSendTracks[from] = cloned;
+        peerSenders[from] = sender;
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'closed' || pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+            try { cloned.stop(); } catch(e){}
+            delete peerSendTracks[from];
+            delete peerSenders[from];
+          }
+        };
+      } catch(e) {
+        console.warn('Erro ao clonar track no createAnswer', e);
+      }
+    }
+
     pc.onicecandidate = e => { if (e.candidate) socket.emit('signal', { room: roomInput.value, to: from, data: { candidate: e.candidate } }); };
     pc.ontrack = e => {
       const a = document.getElementById('a-'+from);
       if (a) a.srcObject = e.streams[0];
       pc.remoteStream = e.streams[0];
+      const audioEl = document.getElementById('a-'+from);
+      if (audioEl) audioEl.muted = !!peerRecvMuted[from];
     };
+
     await pc.setRemoteDescription(new RTCSessionDescription(sdpOffer));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -349,6 +550,7 @@
   }
 
   function status(msg) { statusDiv.textContent = msg; }
+
   </script>
 </body>
 </html>
